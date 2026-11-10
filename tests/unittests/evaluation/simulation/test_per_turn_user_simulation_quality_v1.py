@@ -1,0 +1,1068 @@
+# Copyright 2026 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+from __future__ import annotations
+
+import asyncio
+
+from google.adk.evaluation.eval_case import ConversationScenario
+from google.adk.evaluation.eval_case import Invocation
+from google.adk.evaluation.eval_metrics import EvalMetric
+from google.adk.evaluation.eval_metrics import EvalStatus
+from google.adk.evaluation.eval_metrics import JudgeModelOptions
+from google.adk.evaluation.eval_metrics import LlmBackedUserSimulatorCriterion
+from google.adk.evaluation.evaluator import PerInvocationResult
+from google.adk.evaluation.llm_as_judge import AutoRaterScore
+from google.adk.evaluation.llm_as_judge_utils import Label
+from google.adk.evaluation.simulation.per_turn_user_simulator_quality_v1 import _format_conversation_history
+from google.adk.evaluation.simulation.per_turn_user_simulator_quality_v1 import _parse_llm_response
+from google.adk.evaluation.simulation.per_turn_user_simulator_quality_v1 import PerTurnUserSimulatorQualityV1
+from google.adk.evaluation.simulation.user_simulator_personas import UserBehavior
+from google.adk.evaluation.simulation.user_simulator_personas import UserPersona
+from google.adk.models.llm_response import LlmResponse
+from google.genai import types
+from google.genai import types as genai_types
+import pytest
+
+
+@pytest.mark.parametrize(
+    "response_text",
+    [
+        """```json
+  {
+    "criteria": [
+      {
+        "name": "TEST_NAME",
+        "reasoning": "test_resonining",
+        "passes": True
+      }
+    ],
+    "is_valid_undefined_key": True
+  }
+  ```""",
+        """```json
+  {
+    "criteria": [
+      {
+        "name": "TEST_NAME",
+        "reasoning": "test_resonining",
+        "passes": True
+      }
+    ],
+    "is_valid": "undefined label",
+  }
+  ```""",
+    ],
+)
+def test_parse_llm_response_label_not_found(response_text):
+  label = _parse_llm_response(response_text)
+  assert label == Label.NOT_FOUND
+
+
+@pytest.mark.parametrize(
+    "response_text",
+    [
+        """```json
+  {
+    "criteria": [
+      {
+        "name": "TEST_NAME",
+        "reasoning": "test_resonining",
+        "passes": True
+      }
+    ],
+    "is_valid": True
+  }
+  ```""",
+        """```json
+  {
+    "criteria": [
+      {
+        "name": "TEST_NAME",
+        "reasoning": "test_resonining",
+        "passes": True
+      }
+    ],
+    "is_valid": "true"
+  }
+  ```""",
+        """```json
+  {
+    "criteria": [
+      {
+        "name": "TEST_NAME",
+        "reasoning": "test_resonining",
+        "passes": True
+      }
+    ],
+    "is_valid": "valid"
+  }
+  ```""",
+    ],
+)
+def test_parse_llm_response_label_valid(response_text):
+  label = _parse_llm_response(response_text)
+  assert label == Label.VALID
+
+
+@pytest.mark.parametrize(
+    "response_text",
+    [
+        """```json
+  {
+    "criteria": [
+      {
+        "name": "TEST_NAME",
+        "reasoning": "test_resonining",
+        "passes": False
+      }
+    ],
+    "is_valid": False
+  }
+  ```""",
+        """```json
+  {
+    "criteria": [
+      {
+        "name": "TEST_NAME",
+        "reasoning": "test_resonining",
+        "passes": False
+      }
+    ],
+    "is_valid": "false",
+  }
+  ```""",
+        """```json
+  {
+    "criteria": [
+      {
+        "name": "TEST_NAME",
+        "reasoning": "test_resonining",
+        "passes": False
+      }
+    ],
+    "is_valid": "invalid",
+  }
+  ```""",
+        """```json
+  {
+    "criteria": [
+      {
+        "name": "TEST_NAME",
+        "reasoning": "test_resonining",
+        "passes": False
+      }
+    ],
+    "is_valid": "almost",
+  }
+  ```""",
+        """```json
+  {
+    "criteria": [
+      {
+        "name": "TEST_NAME",
+        "reasoning": "test_resonining",
+        "passes": False
+      }
+    ],
+    "is_valid": "partially_valid",
+  }
+  ```""",
+        """```json
+  {
+    "criteria": [
+      {
+        "name": "TEST_NAME",
+        "reasoning": "test_resonining",
+        "passes": False
+      }
+    ],
+    "is_valid": "partially valid",
+  }
+  ```""",
+        """```json
+  {
+    "criteria": [
+      {
+        "name": "TEST_NAME",
+        "reasoning": "test_resonining",
+        "passes": False
+      }
+    ],
+    "is_valid": "partially",
+  }
+  ```""",
+    ],
+)
+def test_parse_llm_response_label_invalid(response_text):
+  label = _parse_llm_response(response_text)
+  assert label == Label.INVALID
+
+
+def create_test_template() -> str:
+  return """This is a test template with stop signal: `{{stop_signal}}`.
+
+# Conversation Plan
+{{conversation_plan}}
+
+# Conversation History
+{{conversation_history}}
+
+# Generated User Response
+{{generated_user_response}}
+""".strip()
+
+
+def _create_test_evaluator(
+    threshold: float = 1.0, stop_signal: str = "test stop signal"
+) -> PerTurnUserSimulatorQualityV1:
+  evaluator = PerTurnUserSimulatorQualityV1(
+      EvalMetric(
+          metric_name="test_per_turn_user_simulator_quality_v1",
+          threshold=threshold,
+          criterion=LlmBackedUserSimulatorCriterion(
+              threshold=threshold,
+              stop_signal=stop_signal,
+              judge_model_options=JudgeModelOptions(
+                  judge_model="gemini-2.5-flash",
+                  judge_model_config=genai_types.GenerateContentConfig(),
+                  num_samples=3,
+              ),
+          ),
+      ),
+  )
+  return evaluator
+
+
+def _create_test_conversation_scenario(
+    conversation_plan: str = "test conversation plan",
+    starting_prompt: str = "test starting prompt",
+    user_persona: UserPersona = None,
+) -> ConversationScenario:
+  """Returns a ConversationScenario."""
+  return ConversationScenario(
+      starting_prompt=starting_prompt,
+      conversation_plan=conversation_plan,
+      user_persona=user_persona,
+  )
+
+
+def _create_test_invocation(
+    invocation_id: str,
+    user_content: str = "user content",
+    model_content: str = "model content",
+) -> Invocation:
+  return Invocation(
+      invocation_id=invocation_id,
+      user_content=genai_types.Content(
+          parts=[genai_types.Part(text=user_content)],
+          role="user",
+      ),
+      final_response=genai_types.Content(
+          parts=[genai_types.Part(text=model_content)],
+          role="model",
+      ),
+  )
+
+
+def _create_test_invocations(
+    conversation_history: list[str],
+) -> list[Invocation]:
+  conversation_length = len(conversation_history)
+
+  assert conversation_length % 2 == 0
+
+  invocations = []
+  for i in range(conversation_length // 2):
+    user_message = conversation_history[2 * i]
+    model_message = conversation_history[2 * i + 1]
+
+    invocations.append(
+        _create_test_invocation(
+            "turn {i}", user_content=user_message, model_content=model_message
+        )
+    )
+
+  return invocations
+
+
+def test_format_llm_prompt_raises_error_if_previous_invocations_is_none():
+  evaluator = _create_test_evaluator()
+  with pytest.raises(
+      ValueError, match="Previous invocations should have a set value"
+  ):
+    evaluator._format_llm_prompt(
+        invocation=_create_test_invocation("1"),
+        conversation_scenario=_create_test_conversation_scenario(),
+        previous_invocations=None,
+    )
+
+
+def test_format_llm_prompt_raises_error_if_conversation_scenario_is_none():
+  evaluator = _create_test_evaluator()
+  with pytest.raises(
+      ValueError, match="Conversation scenario should have a set value"
+  ):
+    evaluator._format_llm_prompt(
+        invocation=_create_test_invocation("1"),
+        conversation_scenario=None,
+        previous_invocations=[],
+    )
+
+
+def test_convert_llm_response_to_score_pass():
+  evaluator = _create_test_evaluator()
+  auto_rater_response = """```json
+{
+  "is_valid": True,
+}
+```"""
+  llm_response = LlmResponse(
+      content=genai_types.Content(
+          parts=[genai_types.Part(text=auto_rater_response)],
+          role="model",
+      )
+  )
+  auto_rater_score = evaluator._convert_llm_response_to_score(llm_response)
+  assert auto_rater_score == AutoRaterScore(score=1.0)
+
+
+def test_convert_llm_response_to_score_failure():
+  evaluator = _create_test_evaluator()
+  auto_rater_response = """```json
+{
+  "is_valid": False,
+}
+```"""
+  llm_response = LlmResponse(
+      content=genai_types.Content(
+          parts=[genai_types.Part(text=auto_rater_response)],
+          role="model",
+      )
+  )
+  auto_rater_score = evaluator._convert_llm_response_to_score(llm_response)
+  assert auto_rater_score == AutoRaterScore(score=0.0)
+
+
+def test_convert_llm_response_to_score_invalid_json():
+  evaluator = _create_test_evaluator()
+  llm_response = LlmResponse(
+      content=genai_types.Content(
+          parts=[genai_types.Part(text="invalid json")],
+          role="model",
+      )
+  )
+  auto_rater_score = evaluator._convert_llm_response_to_score(llm_response)
+  assert auto_rater_score == AutoRaterScore()
+
+
+def test_convert_llm_response_to_score_missing_key():
+  evaluator = _create_test_evaluator()
+  llm_response = LlmResponse(
+      content=genai_types.Content(
+          parts=[genai_types.Part(text="{}")],
+          role="model",
+      )
+  )
+  auto_rater_score = evaluator._convert_llm_response_to_score(llm_response)
+  assert auto_rater_score == AutoRaterScore()
+
+
+def test_aggregate_samples_not_evaluated():
+  evaluator = _create_test_evaluator()
+  samples = [
+      PerInvocationResult(
+          actual_invocation=_create_test_invocation("1"),
+          score=None,
+          eval_status=EvalStatus.NOT_EVALUATED,
+      ),
+      PerInvocationResult(
+          actual_invocation=_create_test_invocation("2"),
+          score=None,
+          eval_status=EvalStatus.NOT_EVALUATED,
+      ),
+  ]
+
+  aggregation = evaluator._aggregate_samples(samples)
+  assert aggregation == samples[0]
+
+
+def test_aggregate_samples_pass():
+  evaluator = _create_test_evaluator()
+  # The majority of results should be positive.
+  samples = [
+      PerInvocationResult(
+          actual_invocation=_create_test_invocation("1"),
+          score=1.0,
+          eval_status=EvalStatus.PASSED,
+      ),
+      PerInvocationResult(
+          actual_invocation=_create_test_invocation("2"),
+          score=1.0,
+          eval_status=EvalStatus.PASSED,
+      ),
+      PerInvocationResult(
+          actual_invocation=_create_test_invocation("3"),
+          score=0.0,
+          eval_status=EvalStatus.FAILED,
+      ),
+  ]
+
+  aggregation_result = evaluator._aggregate_samples(samples)
+
+  assert aggregation_result.score == 1.0
+  assert aggregation_result.eval_status == EvalStatus.PASSED
+
+
+def test_aggregate_samples_failure():
+  evaluator = _create_test_evaluator()
+
+  # The majority of results should be negative.
+  samples = [
+      PerInvocationResult(
+          actual_invocation=_create_test_invocation("1"),
+          score=1.0,
+          eval_status=EvalStatus.PASSED,
+      ),
+      PerInvocationResult(
+          actual_invocation=_create_test_invocation("2"),
+          score=0.0,
+          eval_status=EvalStatus.FAILED,
+      ),
+      PerInvocationResult(
+          actual_invocation=_create_test_invocation("3"),
+          score=0.0,
+          eval_status=EvalStatus.FAILED,
+      ),
+  ]
+
+  aggregation_result = evaluator._aggregate_samples(samples)
+
+  assert aggregation_result.score == 0.0
+  assert aggregation_result.eval_status == EvalStatus.FAILED
+
+
+def test_format_conversation_history_with_none_values():
+  """Tests that _format_conversation_history handles None values."""
+  invocations = [
+      Invocation(
+          invocation_id="1",
+          user_content=types.Content(),
+          final_response=None,
+      )
+  ]
+  formatted_history = _format_conversation_history(invocations)
+  assert formatted_history == ""
+
+
+def test_format_conversation_history():
+  conversation_history = [
+      "first user prompt.",
+      "first agent response.",
+      "second user prompt.",
+      "second agent response.",
+  ]
+  invocation_history = _create_test_invocations(conversation_history)
+  formatted_history = _format_conversation_history(invocation_history)
+  assert formatted_history == """user: first user prompt.
+
+model: first agent response.
+
+user: second user prompt.
+
+model: second agent response."""
+
+
+def test_evaluate_first_turn_pass():
+  evaluator = _create_test_evaluator(
+      threshold=0.8, stop_signal="test stop signal"
+  )
+  conversation_scenario = _create_test_conversation_scenario(
+      conversation_plan="plan",
+      starting_prompt="test starting prompt",
+  )
+  invocation = _create_test_invocation("1", user_content="test starting prompt")
+
+  result = evaluator._evaluate_first_turn(invocation, conversation_scenario)
+
+  assert result.score == 1.0
+  assert result.eval_status == EvalStatus.PASSED
+
+
+def test_evaluate_first_turn_failure():
+  evaluator = _create_test_evaluator(
+      threshold=1.0, stop_signal="test stop signal"
+  )
+  conversation_scenario = _create_test_conversation_scenario(
+      conversation_plan="plan",
+      starting_prompt="test starting prompt",
+  )
+  invocation = _create_test_invocation("1", "wrong starting prompt")
+
+  result = evaluator._evaluate_first_turn(invocation, conversation_scenario)
+
+  assert result.score == 0.0
+  assert result.eval_status == EvalStatus.FAILED
+
+
+@pytest.mark.parametrize(
+    "user_content",
+    [
+        types.Content(role="user", parts=[]),
+        types.Content(),
+    ],
+)
+def test_evaluate_first_turn_not_evaluated_when_user_content_has_no_text(
+    user_content,
+):
+  """First turn with empty/None parts is not evaluated instead of crashing."""
+  evaluator = _create_test_evaluator(
+      threshold=1.0, stop_signal="test stop signal"
+  )
+  conversation_scenario = _create_test_conversation_scenario(
+      conversation_plan="plan",
+      starting_prompt="test starting prompt",
+  )
+  invocation = Invocation(invocation_id="1", user_content=user_content)
+
+  result = evaluator._evaluate_first_turn(invocation, conversation_scenario)  # pylint: disable=protected-access
+
+  assert result.score is None
+  assert result.eval_status == EvalStatus.NOT_EVALUATED
+
+
+def test_aggregate_conversation_results_all_pass_produces_pass():
+  evaluator = _create_test_evaluator()
+  results = [
+      PerInvocationResult(
+          actual_invocation=_create_test_invocation("1"),
+          score=1.0,
+          eval_status=EvalStatus.PASSED,
+      ),
+      PerInvocationResult(
+          actual_invocation=_create_test_invocation("2"),
+          score=1.0,
+          eval_status=EvalStatus.PASSED,
+      ),
+      PerInvocationResult(
+          actual_invocation=_create_test_invocation("3"),
+          score=1.0,
+          eval_status=EvalStatus.PASSED,
+      ),
+      PerInvocationResult(
+          actual_invocation=_create_test_invocation("4"),
+          score=1.0,
+          eval_status=EvalStatus.PASSED,
+      ),
+  ]
+  aggregation = evaluator._aggregate_conversation_results(results)
+  assert aggregation.overall_score == 1.0
+  assert aggregation.overall_eval_status == EvalStatus.PASSED
+
+
+def test_aggregate_conversation_results_percentage_above_threshold_produces_pass():
+  evaluator = _create_test_evaluator(threshold=0.7)
+  results = [
+      PerInvocationResult(
+          actual_invocation=_create_test_invocation("1"),
+          score=1.0,
+          eval_status=EvalStatus.PASSED,
+      ),
+      PerInvocationResult(
+          actual_invocation=_create_test_invocation("2"),
+          score=1.0,
+          eval_status=EvalStatus.PASSED,
+      ),
+      PerInvocationResult(
+          actual_invocation=_create_test_invocation("3"),
+          score=0.0,
+          eval_status=EvalStatus.PASSED,
+      ),
+      PerInvocationResult(
+          actual_invocation=_create_test_invocation("4"),
+          score=1.0,
+          eval_status=EvalStatus.PASSED,
+      ),
+  ]
+  aggregation = evaluator._aggregate_conversation_results(results)
+  assert aggregation.overall_score == 0.75
+  assert aggregation.overall_eval_status == EvalStatus.PASSED
+
+
+def test_aggregate_conversation_results_all_failures_produces_failure():
+  evaluator = _create_test_evaluator()
+  results = [
+      PerInvocationResult(
+          actual_invocation=_create_test_invocation("1"),
+          score=0.0,
+          eval_status=EvalStatus.FAILED,
+      ),
+      PerInvocationResult(
+          actual_invocation=_create_test_invocation("2"),
+          score=0.0,
+          eval_status=EvalStatus.FAILED,
+      ),
+      PerInvocationResult(
+          actual_invocation=_create_test_invocation("3"),
+          score=0.0,
+          eval_status=EvalStatus.FAILED,
+      ),
+      PerInvocationResult(
+          actual_invocation=_create_test_invocation("4"),
+          score=0.0,
+          eval_status=EvalStatus.FAILED,
+      ),
+  ]
+  aggregation = evaluator._aggregate_conversation_results(results)
+  assert aggregation.overall_score == 0.0
+  assert aggregation.overall_eval_status == EvalStatus.FAILED
+
+
+def test_aggregate_conversation_percentage_below_threshold_produces_failure():
+  evaluator = _create_test_evaluator(threshold=1.0)
+  results = [
+      PerInvocationResult(
+          actual_invocation=_create_test_invocation("1"),
+          score=0.0,
+          eval_status=EvalStatus.FAILED,
+      ),
+      PerInvocationResult(
+          actual_invocation=_create_test_invocation("2"),
+          score=1.0,
+          eval_status=EvalStatus.PASSED,
+      ),
+      PerInvocationResult(
+          actual_invocation=_create_test_invocation("3"),
+          score=1.0,
+          eval_status=EvalStatus.PASSED,
+      ),
+      PerInvocationResult(
+          actual_invocation=_create_test_invocation("4"),
+          score=1.0,
+          eval_status=EvalStatus.PASSED,
+      ),
+  ]
+  aggregation = evaluator._aggregate_conversation_results(results)
+  assert aggregation.overall_score == 0.75
+  assert aggregation.overall_eval_status == EvalStatus.FAILED
+
+
+@pytest.mark.asyncio
+async def test_evaluate_invocations_all_pass():
+  evaluator = _create_test_evaluator()
+
+  async def sample_llm_valid(*args, **kwargs):  # pylint: disable=unused-argument
+    return AutoRaterScore(score=1.0)
+
+  evaluator._sample_llm = sample_llm_valid  # pylint: disable=protected-access
+  starting_prompt = "first user prompt."
+  conversation_scenario = _create_test_conversation_scenario(
+      starting_prompt=starting_prompt
+  )
+  invocations = _create_test_invocations(
+      [starting_prompt, "model 1.", "user 2.", "model 2."]
+  )
+  result = await evaluator.evaluate_invocations(
+      actual_invocations=invocations,
+      expected_invocations=None,
+      conversation_scenario=conversation_scenario,
+  )
+
+  assert result.overall_score == 1.0
+  assert result.overall_eval_status == EvalStatus.PASSED
+  assert len(result.per_invocation_results) == 2
+  assert result.per_invocation_results[0].score == 1.0
+  assert result.per_invocation_results[1].score == 1.0
+
+
+@pytest.mark.asyncio
+async def test_evaluate_invocations_none_judge_model_config():
+  """Tests evaluation when judge_model_config is None."""
+  evaluator = PerTurnUserSimulatorQualityV1(
+      EvalMetric(
+          metric_name="test_per_turn_user_simulator_quality_v1",
+          threshold=1.0,
+          criterion=LlmBackedUserSimulatorCriterion(
+              threshold=1.0,
+              stop_signal="test stop signal",
+              judge_model_options=JudgeModelOptions(
+                  judge_model="gemini-2.5-flash",
+                  judge_model_config=None,
+                  num_samples=1,
+              ),
+          ),
+      ),
+  )
+
+  async def sample_llm_valid(*args, **kwargs):  # pylint: disable=unused-argument
+    return AutoRaterScore(score=1.0)
+
+  evaluator._sample_llm = sample_llm_valid  # pylint: disable=protected-access
+  starting_prompt = "first user prompt."
+  conversation_scenario = _create_test_conversation_scenario(
+      starting_prompt=starting_prompt
+  )
+  invocations = _create_test_invocations(
+      [starting_prompt, "model 1.", "user 2.", "model 2."]
+  )
+  result = await evaluator.evaluate_invocations(
+      actual_invocations=invocations,
+      expected_invocations=None,
+      conversation_scenario=conversation_scenario,
+  )
+
+  assert result.overall_score == 1.0
+  assert result.overall_eval_status == EvalStatus.PASSED
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "user_judge_model_config",
+    [
+        None,
+        genai_types.GenerateContentConfig(temperature=0.3),
+    ],
+    ids=["default_config", "user_supplied_config"],
+)
+async def test_evaluate_invocations_judge_request_disables_afc(
+    user_judge_model_config,
+):
+  # Judge requests must disable google-genai's automatic function calling
+  # regardless of whether the caller supplied a judge_model_config, since the
+  # judge never calls tools and leaving AFC on only produces a spurious
+  # per-request warning on every eval run.
+  evaluator = PerTurnUserSimulatorQualityV1(
+      EvalMetric(
+          metric_name="test_per_turn_user_simulator_quality_v1",
+          threshold=1.0,
+          criterion=LlmBackedUserSimulatorCriterion(
+              threshold=1.0,
+              stop_signal="test stop signal",
+              judge_model_options=JudgeModelOptions(
+                  judge_model="gemini-2.5-flash",
+                  judge_model_config=user_judge_model_config,
+                  num_samples=1,
+              ),
+          ),
+      ),
+  )
+
+  captured_requests = []
+
+  async def capture_sample(llm_request):
+    captured_requests.append(llm_request)
+    return AutoRaterScore(score=1.0)
+
+  evaluator._sample_llm = capture_sample  # pylint: disable=protected-access
+  starting_prompt = "first user prompt."
+  conversation_scenario = _create_test_conversation_scenario(
+      starting_prompt=starting_prompt
+  )
+  invocations = _create_test_invocations(
+      [starting_prompt, "model 1.", "user 2.", "model 2."]
+  )
+  await evaluator.evaluate_invocations(
+      actual_invocations=invocations,
+      expected_invocations=None,
+      conversation_scenario=conversation_scenario,
+  )
+
+  assert captured_requests
+  for request in captured_requests:
+    assert request.config.automatic_function_calling is not None
+    assert request.config.automatic_function_calling.disable is True
+
+
+def _mock_judge_llm(mocker):
+  mock_registry = mocker.patch(
+      "google.adk.evaluation.simulation.per_turn_user_simulator_quality_v1"
+      ".LLMRegistry"
+  )
+  mock_llm_cls = mocker.MagicMock()
+  mock_registry.return_value.resolve.return_value = mock_llm_cls
+  return mock_llm_cls.return_value
+
+
+async def test_evaluate_invocations_runs_judge_calls_up_to_parallelism_limit(
+    mocker,
+):
+  """Judge calls run concurrently, never more than parallelism_limit at once.
+
+  Setup: parallelism_limit=3, num_samples=2 and four turns, so three
+    intermediate turns and the stop-signal check issue eight judge calls. Each
+    call holds its slot until three calls are in flight.
+  Act: Evaluate the conversation.
+  Assert: The most judge calls in flight at once is three.
+  """
+  mock_llm = _mock_judge_llm(mocker)
+  evaluator = PerTurnUserSimulatorQualityV1(
+      EvalMetric(
+          metric_name="test_per_turn_user_simulator_quality_v1",
+          threshold=0.75,
+          criterion=LlmBackedUserSimulatorCriterion(
+              threshold=0.75,
+              stop_signal="test stop signal",
+              judge_model_options=JudgeModelOptions(
+                  judge_model="gemini-2.5-flash",
+                  num_samples=2,
+                  parallelism_limit=3,
+              ),
+          ),
+      ),
+  )
+  in_flight = 0
+  max_in_flight = 0
+  all_slots_filled = asyncio.Event()
+
+  async def mock_generate_content_async(llm_request):
+    del llm_request
+    nonlocal in_flight, max_in_flight
+    in_flight += 1
+    max_in_flight = max(max_in_flight, in_flight)
+    if in_flight == 3:
+      all_slots_filled.set()
+    try:
+      await asyncio.wait_for(all_slots_filled.wait(), timeout=1.0)
+      # Yield so a call beyond the limit, if unbounded, would start now.
+      await asyncio.sleep(0.01)
+      yield LlmResponse(
+          content=genai_types.Content(
+              parts=[genai_types.Part(text='{"is_valid": "valid"}')],
+              role="model",
+          )
+      )
+    finally:
+      in_flight -= 1
+
+  mock_llm.generate_content_async = mock_generate_content_async
+  invocations = [
+      _create_test_invocation(
+          "turn_0", user_content="start", model_content="m0"
+      ),
+      _create_test_invocation("turn_1", user_content="u1", model_content="m1"),
+      _create_test_invocation("turn_2", user_content="u2", model_content="m2"),
+      _create_test_invocation("turn_3", user_content="u3", model_content="m3"),
+  ]
+  scenario = _create_test_conversation_scenario(starting_prompt="start")
+
+  await evaluator.evaluate_invocations(
+      actual_invocations=invocations,
+      conversation_scenario=scenario,
+  )
+
+  assert max_in_flight == 3
+
+
+async def test_evaluate_invocations_keeps_turn_order_on_out_of_order_finish(
+    mocker,
+):
+  """Results keep turn order when a later turn's judge call finishes first.
+
+  Setup: parallelism_limit=3 and four turns, so three intermediate turns and
+    the stop-signal check issue four judge calls. The call for turn_1 waits
+    until the other three finish and judges turn_1 invalid; the rest are valid.
+  Act: Evaluate the conversation.
+  Assert: turn_1 finished last, yet results are in turn order, each with its
+    own score.
+  """
+  mock_llm = _mock_judge_llm(mocker)
+  evaluator = PerTurnUserSimulatorQualityV1(
+      EvalMetric(
+          metric_name="test_per_turn_user_simulator_quality_v1",
+          threshold=0.75,
+          criterion=LlmBackedUserSimulatorCriterion(
+              threshold=0.75,
+              stop_signal="test stop signal",
+              judge_model_options=JudgeModelOptions(
+                  judge_model="gemini-2.5-flash",
+                  num_samples=1,
+                  parallelism_limit=3,
+              ),
+          ),
+      ),
+  )
+  finished = []
+  others_finished = asyncio.Event()
+
+  async def mock_generate_content_async(llm_request):
+    prompt_text = llm_request.contents[0].parts[0].text
+    is_turn_1 = prompt_text.endswith(
+        "# Generated User Response\noff-plan turn 1"
+    )
+    if is_turn_1:
+      await asyncio.wait_for(others_finished.wait(), timeout=1.0)
+    finished.append("turn_1" if is_turn_1 else "other")
+    if len(finished) == 3:
+      others_finished.set()
+    verdict = "invalid" if is_turn_1 else "valid"
+    yield LlmResponse(
+        content=genai_types.Content(
+            parts=[genai_types.Part(text=f'{{"is_valid": "{verdict}"}}')],
+            role="model",
+        )
+    )
+
+  mock_llm.generate_content_async = mock_generate_content_async
+  invocations = [
+      _create_test_invocation(
+          "turn_0", user_content="start", model_content="m0"
+      ),
+      _create_test_invocation(
+          "turn_1", user_content="off-plan turn 1", model_content="m1"
+      ),
+      _create_test_invocation("turn_2", user_content="u2", model_content="m2"),
+      _create_test_invocation("turn_3", user_content="u3", model_content="m3"),
+  ]
+  scenario = _create_test_conversation_scenario(starting_prompt="start")
+
+  result = await evaluator.evaluate_invocations(
+      actual_invocations=invocations,
+      conversation_scenario=scenario,
+  )
+
+  assert finished[-1] == "turn_1"
+  assert [
+      r.actual_invocation.invocation_id for r in result.per_invocation_results
+  ] == ["turn_0", "turn_1", "turn_2", "turn_3"]
+  assert [r.score for r in result.per_invocation_results] == [
+      1.0,
+      0.0,
+      1.0,
+      1.0,
+  ]
+
+
+async def test_evaluate_invocations_stop_signal_failure_marks_last_turn_failed(
+    mocker,
+):
+  """A failed stop-signal check still overwrites the final turn."""
+  mock_llm = _mock_judge_llm(mocker)
+  evaluator = PerTurnUserSimulatorQualityV1(
+      EvalMetric(
+          metric_name="test_per_turn_user_simulator_quality_v1",
+          threshold=1.0,
+          criterion=LlmBackedUserSimulatorCriterion(
+              threshold=1.0,
+              stop_signal="test stop signal",
+              judge_model_options=JudgeModelOptions(
+                  judge_model="gemini-2.5-flash",
+                  num_samples=2,
+                  parallelism_limit=3,
+              ),
+          ),
+      ),
+  )
+
+  async def mock_generate_content_async(llm_request):
+    prompt_text = llm_request.contents[0].parts[0].text
+    is_stop_signal = prompt_text.endswith(
+        "# Generated User Response\ntest stop signal"
+    )
+    verdict = "invalid" if is_stop_signal else "valid"
+    yield LlmResponse(
+        content=genai_types.Content(
+            parts=[genai_types.Part(text=f'{{"is_valid": "{verdict}"}}')],
+            role="model",
+        )
+    )
+
+  mock_llm.generate_content_async = mock_generate_content_async
+
+  invocations = [
+      _create_test_invocation(
+          "turn_0", user_content="start", model_content="m0"
+      ),
+      _create_test_invocation("turn_1", user_content="u1", model_content="m1"),
+  ]
+  scenario = _create_test_conversation_scenario(starting_prompt="start")
+
+  result = await evaluator.evaluate_invocations(
+      actual_invocations=invocations,
+      conversation_scenario=scenario,
+  )
+
+  assert [r.eval_status for r in result.per_invocation_results] == [
+      EvalStatus.PASSED,
+      EvalStatus.FAILED,
+  ]
+  assert result.overall_score == 0.5
+  assert result.overall_eval_status == EvalStatus.FAILED
+
+
+async def test_evaluate_invocations_cancels_in_flight_sibling_calls_on_error(
+    mocker,
+):
+  """A judge call that raises cancels and drains in-flight sibling calls."""
+  mock_llm = _mock_judge_llm(mocker)
+  evaluator = PerTurnUserSimulatorQualityV1(
+      EvalMetric(
+          metric_name="test_per_turn_user_simulator_quality_v1",
+          threshold=1.0,
+          criterion=LlmBackedUserSimulatorCriterion(
+              threshold=1.0,
+              stop_signal="test stop signal",
+              judge_model_options=JudgeModelOptions(
+                  judge_model="gemini-2.5-flash",
+                  num_samples=2,
+                  parallelism_limit=3,
+              ),
+          ),
+      ),
+  )
+
+  in_flight = 0
+  cancelled_calls = 0
+  call_index = 0
+  all_slots_filled = asyncio.Event()
+  never_finishes = asyncio.Event()
+
+  async def mock_generate_content_async(llm_request):
+    del llm_request
+    nonlocal in_flight, cancelled_calls, call_index
+    my_index = call_index
+    call_index += 1
+    in_flight += 1
+    if in_flight >= 3:
+      all_slots_filled.set()
+    try:
+      await asyncio.wait_for(all_slots_filled.wait(), timeout=1.0)
+      if my_index == 0:
+        raise RuntimeError("judge model failure")
+      await asyncio.wait_for(never_finishes.wait(), timeout=2.0)
+      yield LlmResponse()
+    except asyncio.CancelledError:
+      cancelled_calls += 1
+      raise
+    finally:
+      in_flight -= 1
+
+  mock_llm.generate_content_async = mock_generate_content_async
+
+  invocations = [
+      _create_test_invocation(
+          "turn_0", user_content="start", model_content="m0"
+      ),
+      _create_test_invocation("turn_1", user_content="u1", model_content="m1"),
+      _create_test_invocation("turn_2", user_content="u2", model_content="m2"),
+  ]
+  scenario = _create_test_conversation_scenario(starting_prompt="start")
+
+  with pytest.raises(RuntimeError, match="judge model failure"):
+    await evaluator.evaluate_invocations(
+        actual_invocations=invocations,
+        conversation_scenario=scenario,
+    )
+
+  assert in_flight == 0
+  assert cancelled_calls >= 2
